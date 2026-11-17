@@ -150,6 +150,23 @@ def video_backend():
     return "torchcodec" if importlib.util.find_spec("torchcodec") else "pyav"
 
 
+def dataset_root():
+    base = os.environ.get("HF_LEROBOT_HOME") or os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "lerobot")
+    return os.path.join(base, DATASET)
+
+
+def ensure_full_dataset():
+    """Download the WHOLE dataset once. lerobot-train with --dataset.episodes only fetches the
+    files holding those episodes, and a later stage asking for other episodes then finds the
+    folder present but its files missing ("Instruction 'train' corresponds to no data")."""
+    from huggingface_hub import snapshot_download
+    root = dataset_root()
+    log(f"dataset: making sure all of {DATASET} is in {root} (1.9 GB, first time only)")
+    snapshot_download(DATASET, repo_type="dataset", local_dir=root)
+    return root
+
+
 # ---------------------------------------------------------------- train / eval
 
 def ckpt(stage_dir, which="last"):
@@ -170,7 +187,8 @@ def train(cfg, init_args, extra, episodes, steps, stage_dir, seed, save_freq, lo
     if os.path.exists(stage_dir):
         shutil.rmtree(stage_dir)                                  # unfinished: start the stage again
     cmd = ["lerobot-train", *init_args, "--policy.push_to_hub=false",
-           f"--dataset.repo_id={DATASET}", f"--dataset.episodes=[{','.join(map(str, episodes))}]",
+           f"--dataset.repo_id={DATASET}", f"--dataset.root={dataset_root()}",
+           f"--dataset.episodes=[{','.join(map(str, episodes))}]",
            f"--dataset.video_backend={video_backend()}", f"--batch_size={cfg.batch_size}",
            f"--num_workers={cfg.num_workers}", f"--steps={steps}", f"--save_freq={save_freq}",
            f"--log_freq={log_freq}", "--eval_freq=0", "--wandb.enable=false", f"--seed={seed}",
@@ -309,7 +327,8 @@ def main():
         if shutil.which(tool) is None:
             raise SystemExit(f"{tool} not found: activate the env_vla environment first")
     log(f"dataset {DATASET}, MUJOCO_GL={os.environ.get('MUJOCO_GL')}, video backend {video_backend()}")
-    sets = episode_sets(out if args.smoke else out)
+    ensure_full_dataset()
+    sets = episode_sets(out)
     if args.smoke:
         sets = {k: v[:4] for k, v in sets.items()}
     variant = choose_init(cfg, sets, out)
