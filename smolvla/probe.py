@@ -5,7 +5,7 @@ Each check runs on its own; a failure prints a traceback and the next check stil
 """
 import importlib, os, subprocess, sys, time, traceback
 
-DATASET = os.environ.get("VLA_DATASET", "HuggingFaceVLA/libero")
+DATASET = os.environ.get("VLA_DATASET", "lerobot/libero")
 POLICY = os.environ.get("VLA_POLICY", "lerobot/smolvla_base")
 SUITES = ["libero_object", "libero_goal", "libero_spatial", "libero_10"]
 
