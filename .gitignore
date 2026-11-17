@@ -4,3 +4,6 @@ checkpoints/
 *.npz
 __pycache__/
 *.log
+logs/
+results_*.tgz
+results/*_smoke/

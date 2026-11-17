@@ -1,6 +1,6 @@
 """Time 200 training steps of the real-config model, to estimate a full run on this GPU.
 
-usage: CUDA_VISIBLE_DEVICES=1 python bench.py [--mem-frac 0.33]
+usage: CUDA_VISIBLE_DEVICES=1 python bench.py [--untied] [--mem-frac 0.33]
 """
 import argparse, time
 
@@ -9,12 +9,14 @@ import torch
 from vla import Config, TinyGPT, set_seed
 
 p = argparse.ArgumentParser()
-p.add_argument("--mem-frac", type=float, default=0.33)
+p.add_argument("--mem-frac", type=float, default=None)
+p.add_argument("--untied", action="store_true", help="time the v2 model (untied token table)")
 args = p.parse_args()
-torch.cuda.set_per_process_memory_fraction(args.mem_frac)
+if args.mem_frac:
+    torch.cuda.set_per_process_memory_fraction(args.mem_frac)
 set_seed(0)
 
-cfg, V = Config(), 50257
+cfg, V = Config(tie_weights=not args.untied), 50257
 m = TinyGPT(cfg, V).cuda()
 opt = torch.optim.AdamW(m.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
@@ -39,5 +41,8 @@ torch.cuda.synchronize()
 per1k = (time.time() - t0) / 200 * 1000 / 60
 # one seed, all 4 arms: A and C 5000+5000+2x500, B 5000+2x500, S 2x500 = 30k steps, plus evals (~+5%)
 print(f"{per1k:.2f} min per 1000 steps   (RTX 3080 desktop: ~3.0)")
-print(f"one seed (4 arms) ~ {per1k * 31.5:.0f} min   (RTX 3080 desktop: ~95)")
+print(f"v1, one seed (4 arms) ~ {per1k * 31.5:.0f} min   (RTX 3080 desktop: ~95)")
+# v2 per seed: 35k training steps (A, C: 10k + 6 x 500; B: 5k + 6 x 500; S: 2 x 500) plus
+# ~2,600 evaluations of 300k tokens (dense early scoring), each ~12 step-equivalents -> ~66k
+print(f"v2, one seed (4 arms, 5 depths) ~ {per1k * 66 / 60:.1f} h on its own; seeds run in parallel share the GPU")
 print(f"peak memory {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")

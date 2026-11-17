@@ -20,7 +20,37 @@ Does a small language model that has *forgotten* a domain relearn it faster than
 - **Scoring.** Every curve is scored on held-out TinyStories (the "story test").
 - **Memorization probe.** At the start and end of stage 3, the seen and fresh piles are also scored directly. If A is better on the seen pile than on the fresh one, specific stage-1 text survived stage 2, not just the language.
 
-## Run
+## Everything in one command (Nov 2026)
+
+```bash
+git clone https://github.com/GitExcited/vla-tinygpt.git && cd vla-tinygpt
+SMOKE=1 bash run_all.sh                                # a few minutes: checks the whole pipeline
+RESULTS_DEST=me@myhost:~/runs/ bash run_all.sh         # the real thing; detaches, prints a tail -f line
+```
+
+`run_all.sh` runs two experiments side by side on one GPU, writes the reports, packs
+`results_<run id>.tgz`, and copies it to `RESULTS_DEST` with `scp` if you set it (otherwise it
+prints the `scp` line to pull it). Rerunning resumes where it stopped. Options are listed at the
+top of the script (`GPU`, `TINY_SEEDS`, `HIDDEN_SEEDS`, ...).
+
+1. **TinyGPT v2** (`vla.py --preset v2`, results in `results/v2/`). The experiment above, done
+   properly: 5 seeds, untied token table, story loss scored at every step for the first 50
+   stage-3 steps, and stage 3 run from five points of stage 2 (after 100, 500, 1,000, 2,000 and
+   5,000 code steps) to see whether A's lead shrinks the longer it trains on code. One pass over
+   a ~4.1M-token relearning pile. `depths.py results/v2` writes `depths.md` / `depths.png`.
+   Disk: the stage-2 snapshots take about 1 GB per (seed, arm), ~15 GB in total, in `checkpoints/`.
+2. **Gone or hidden?** (`hidden/`, results in `results/hidden/`). Synthetic biographies in the
+   style of Palit et al. 2026 (arXiv 2610.08718), reimplemented here with our own names,
+   answers and templates: an 8-layer attention-only transformer learns 2,000 people (A) plus
+   2,000 others, then is fine-tuned on 500 new people with no replay. A **twin** is trained
+   identically except that A is replaced by 2,000 different people. From checkpoints along the
+   fine-tuning, both relearn only the first half of A; the second half is never shown, so its
+   score can only come back if its facts were still stored. Also: removing the top parts of the
+   weight update (vs random parts), and Palit's logit common-part removal.
+   `python -m hidden.report results/hidden` writes `summary.md`, `finetune.png`,
+   `untaught.png` and `edit.png`.
+
+## Run (v1)
 
 ```bash
 pip install -r requirements.txt

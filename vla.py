@@ -46,6 +46,7 @@ class Config:
     d_model: int = 384
     n_layer: int = 6
     n_head: int = 6
+    tie_weights: bool = True       # input token table == output head (v1); v2 unties them
     # optimization (a fresh AdamW at the start of every stage, constant LR)
     batch_size: int = 32
     lr: float = 6e-4
@@ -60,6 +61,13 @@ class Config:
     # evaluation
     eval_every: int = 100          # stages 1-2
     relearn_eval_every: int = 25   # stage 3
+    stage2_dense_steps: int = 0    # stage 2: also score every `stage2_dense_every` steps up to here
+    stage2_dense_every: int = 10
+    relearn_dense_steps: int = 0   # stage 3: also score the story test at EVERY step up to here
+    stage3_eval_code: bool = False # stage 3: also score code (at the sparse points only)
+    # stage 2 "depths": stage 3 is run from a snapshot taken at each of these stage-2 steps
+    # ("" = only from the end of stage 2, as in v1). The last depth must equal orth_steps.
+    stage2_depths: str = ""
     target_tol: float = 0.05       # "recovered" = within 5% of A's end-of-stage-1 loss
     # data sizes (tokens)
     relearn_tokens: int = 1_000_000   # ~2.4% of the ~41M stage-1 tokens
@@ -79,9 +87,23 @@ SMOKE_OVERRIDES = dict(
     relearn_tokens=16 * 33 * 20, val_tokens=20_000,
 )
 
+# v2 ("done properly", Nov 2026): untied token table, dense early scoring, stage 3 from five
+# stage-2 depths, one pass over a ~4.1M-token relearning pile (500 steps x 32 x 257 tokens).
+V2_OVERRIDES = dict(
+    tie_weights=False,
+    stage2_dense_steps=500, stage2_dense_every=10,
+    relearn_dense_steps=50, stage3_eval_code=True,
+    stage2_depths="100,500,1000,2000,5000",
+    relearn_tokens=4_200_000,
+)
+# smoke version of v2, for a quick CPU check of the whole pipeline
+V2_SMOKE_OVERRIDES = dict(V2_OVERRIDES, stage2_depths="100,500,1500", relearn_tokens=16 * 33 * 300,
+                          stage2_dense_steps=100, relearn_dense_steps=20)
+
 # fields that change what stages 1-2 produce; a saved checkpoint is reused only if all match
 STAGE12_FIELDS = ("seed", "smoke", "block_size", "d_model", "n_layer", "n_head", "batch_size",
-                  "lr", "orth_lr", "weight_decay", "grad_clip", "pretrain_steps", "orth_steps")
+                  "lr", "orth_lr", "weight_decay", "grad_clip", "pretrain_steps", "orth_steps",
+                  "tie_weights", "stage2_depths")
 
 ARMS = {"A": "pre_A", "B": None, "C": "pre_C", "S": None}   # arm -> stage-1 dataset
 SUBSETS = ["seen", "fresh"]
@@ -247,7 +269,8 @@ class TinyGPT(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
         self.ln_f = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, vocab, bias=False)
-        self.head.weight = self.tok.weight        # weight tying
+        if cfg.tie_weights:
+            self.head.weight = self.tok.weight    # weight tying (v1)
         self.apply(self._init)
 
     @staticmethod
@@ -289,18 +312,26 @@ def eval_loss(model, chunks, cfg: Config) -> float:
     return total / n
 
 
-def train_stage(model, stream, steps, lr, cfg, eval_sets, eval_every, stage, step_offset=0):
-    """Train for `steps` steps; return a log of evals (including step 0, before any update)."""
+def train_stage(model, stream, steps, lr, cfg, eval_sets, eval_every, stage, step_offset=0,
+                dense_until=0, dense_every=1, dense_sets=None, snapshot_at=(), snapshots=None):
+    """Train for `steps` steps; return a log of evals (including step 0, before any update).
+
+    Sparse points (every `eval_every` steps, and the last step) score all `eval_sets`.
+    Dense points (every `dense_every` steps up to `dense_until`) score only `dense_sets`
+    (default: all). At each step in `snapshot_at` a CPU copy of the weights goes into
+    `snapshots[step]`. Neither evals nor snapshots change the training itself.
+    """
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=cfg.weight_decay)
     model.train()
     rows = []
+    dense_sets = list(eval_sets) if dense_sets is None else dense_sets
 
-    def record(step, train_loss):
+    def record(step, train_loss, names):
         row = {"stage": stage, "step": step, "global_step": step_offset + step, "train_loss": train_loss}
-        row.update({name: eval_loss(model, ch, cfg) for name, ch in eval_sets.items()})
+        row.update({name: eval_loss(model, eval_sets[name], cfg) for name in names})
         rows.append(row)
 
-    record(0, None)
+    record(0, None, list(eval_sets))
     for s in range(1, steps + 1):
         x, y = stream.next()
         loss = model(x, y)[1]        # [1] only: holding the logits through backward wastes ~1.5 GB
@@ -310,8 +341,12 @@ def train_stage(model, stream, steps, lr, cfg, eval_sets, eval_every, stage, ste
         opt.step()
         if s % 1000 == 0:
             log(f"    {stage} step {s}/{steps}")
+        if s in snapshot_at:
+            snapshots[s] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if s % eval_every == 0 or s == steps:
-            record(s, loss.item())
+            record(s, loss.item(), list(eval_sets))
+        elif s <= dense_until and s % dense_every == 0:
+            record(s, loss.item(), dense_sets)
     return rows
 
 
@@ -320,6 +355,16 @@ def probe(model, chunks, cfg: Config) -> dict:
     return {name: eval_loss(model, chunks[key], cfg)
             for name, key in (("pre_val", "pre_val"), ("seen_pile", "relearn_seen"),
                               ("fresh_pile", "relearn_fresh"))}
+
+
+def stage2_depths(cfg: Config) -> list:
+    """Stage-2 steps that stage 3 is run from; always ends with orth_steps."""
+    if not cfg.stage2_depths:
+        return [cfg.orth_steps]
+    depths = sorted(int(d) for d in cfg.stage2_depths.split(","))
+    if depths[-1] != cfg.orth_steps or depths[0] < 1:
+        raise SystemExit(f"stage2_depths {cfg.stage2_depths}: must be >= 1 and end at orth_steps={cfg.orth_steps}")
+    return depths
 
 
 def stage12_key(cfg: Config) -> str:
@@ -339,6 +384,12 @@ def run_seed(cfg: Config, chunks: dict, vocab: int, arms, out_dir: str, ckpt_dir
         m.load_state_dict(state)
         return m
 
+    depths = stage2_depths(cfg)
+    final = depths[-1]
+    s3_sets = {"pre_val": chunks["pre_val"]}
+    if cfg.stage3_eval_code:
+        s3_sets["orth_val"] = chunks["orth_val"]
+
     for arm in arms:
         stage1 = ARMS[arm]
         out = os.path.join(out_dir, f"seed{cfg.seed}_arm{arm}.json")
@@ -348,11 +399,11 @@ def run_seed(cfg: Config, chunks: dict, vocab: int, arms, out_dir: str, ckpt_dir
         t0 = time.time()
         ckpt = os.path.join(ckpt_dir, f"seed{cfg.seed}_arm{arm}_{stage12_key(cfg)}.pt")
 
-        if arm == "S":                                   # no stages 1-2
-            after12, stages12, probes = init_state, [], {}
+        if arm == "S":                                   # no stages 1-2: relearn from the init
+            by_depth, stages12, probes = {final: init_state}, [], {}
         elif os.path.exists(ckpt):
             saved = torch.load(ckpt, map_location="cpu")
-            after12, stages12, probes = saved["model"], saved["stages12"], saved["probes"]
+            by_depth, stages12, probes = saved["depths"], saved["stages12"], saved["probes"]
             log(f"seed {cfg.seed} arm {arm}: stages 1-2 loaded from {ckpt}")
         else:
             model = model_from(init_state)
@@ -365,30 +416,44 @@ def run_seed(cfg: Config, chunks: dict, vocab: int, arms, out_dir: str, ckpt_dir
                 g += cfg.pretrain_steps
                 probes["after_stage1"] = probe(model, chunks, cfg)
             s2 = BatchStream(chunks["orth"], cfg.batch_size, cfg.seed + 2, cfg.device)
+            by_depth = {}
             stages12 += train_stage(model, s2, cfg.orth_steps, orth_lr, cfg, eval_sets,
-                                    cfg.eval_every, "2_orth", g)
-            after12 = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                                    cfg.eval_every, "2_orth", g,
+                                    dense_until=cfg.stage2_dense_steps,
+                                    dense_every=cfg.stage2_dense_every,
+                                    snapshot_at=set(depths), snapshots=by_depth)
             os.makedirs(ckpt_dir, exist_ok=True)
-            torch.save({"model": after12, "stages12": stages12, "probes": probes,
+            torch.save({"depths": by_depth, "stages12": stages12, "probes": probes,
                         "config": asdict(cfg)}, ckpt)
             del model
 
-        offset = 0 if arm == "S" else (cfg.pretrain_steps if stage1 else 0) + cfg.orth_steps
-        relearn = {}
-        for sub in SUBSETS:
-            m = model_from(after12)                      # both piles branch from the same weights
-            if sub == SUBSETS[0]:
-                probes["stage3_start"] = probe(m, chunks, cfg)
-            s3 = BatchStream(chunks[f"relearn_{sub}"], cfg.batch_size, cfg.seed + 3, cfg.device)
-            relearn[sub] = train_stage(m, s3, cfg.relearn_steps, relearn_lr, cfg,
-                                       {"pre_val": chunks["pre_val"]}, cfg.relearn_eval_every,
-                                       f"3_relearn_{sub}", offset)
-            probes[f"stage3_end_{sub}"] = probe(m, chunks, cfg)
-            del m
+        # stage 3 from every stage-2 depth: the fresh pile always, the seen pile at the end
+        # of stage 2 only (the v1 memorization probe).
+        relearn_by_depth = {}
+        for depth in depths if arm != "S" else [final]:
+            offset = 0 if arm == "S" else (cfg.pretrain_steps if stage1 else 0) + depth
+            subsets = SUBSETS if depth == final else ["fresh"]
+            relearn_by_depth[str(depth)] = {}
+            for sub in subsets:
+                m = model_from(by_depth[depth])          # every pile branches from the same weights
+                if sub == subsets[0]:
+                    probes[f"stage3_start_d{depth}"] = probe(m, chunks, cfg)
+                    if depth == final:
+                        probes["stage3_start"] = probes[f"stage3_start_d{depth}"]
+                s3 = BatchStream(chunks[f"relearn_{sub}"], cfg.batch_size, cfg.seed + 3, cfg.device)
+                relearn_by_depth[str(depth)][sub] = train_stage(
+                    m, s3, cfg.relearn_steps, relearn_lr, cfg, s3_sets, cfg.relearn_eval_every,
+                    f"3_relearn_{sub}", offset, dense_until=cfg.relearn_dense_steps,
+                    dense_every=1, dense_sets=["pre_val"])
+                if depth == final:
+                    probes[f"stage3_end_{sub}"] = probe(m, chunks, cfg)
+                del m
+        relearn = relearn_by_depth[str(final)]           # v1 layout, read by plots.py
 
         with open(out, "w") as f:
             json.dump({"arm": arm, "seed": cfg.seed, "config": asdict(cfg),
-                       "stages12": stages12, "probes": probes, "relearn": relearn}, f, indent=1)
+                       "stages12": stages12, "probes": probes, "relearn": relearn,
+                       "relearn_by_depth": relearn_by_depth}, f, indent=1)
         if cfg.device == "cuda":
             torch.cuda.empty_cache()
         start = probes["stage3_start"]
@@ -423,10 +488,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     p.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
-    p.add_argument("--tag", default="main", help="results go to <results-dir>/<tag>/")
+    p.add_argument("--tag", default=None,
+                   help="results go to <results-dir>/<tag>/ (default: main for v1, v2 for v2)")
     p.add_argument("--results-dir", default="results")
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--smoke", action="store_true", help="tiny synthetic data and model")
+    p.add_argument("--preset", choices=["v1", "v2"], default="v1",
+                   help="v2 = untied tokens, dense scoring, stage 3 from five stage-2 depths")
+    p.add_argument("--prepare-only", action="store_true",
+                   help="download/tokenize the data into the cache, then exit")
     p.add_argument("--mem-frac", type=float, default=None,
                    help="cap this process's share of GPU memory (0.33 = 32 GB on the lab server)")
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override Config fields")
@@ -435,14 +505,20 @@ def main():
     cfg = Config()
     if args.smoke:
         cfg = replace(cfg, **SMOKE_OVERRIDES)
+    if args.preset == "v2":
+        cfg = replace(cfg, **(V2_SMOKE_OVERRIDES if args.smoke else V2_OVERRIDES))
     cfg = replace(cfg, **parse_set(args.set))
+    stage2_depths(cfg)                                   # fail early on bad depths
     if cfg.device == "cuda" and args.mem_frac:
         torch.cuda.set_per_process_memory_fraction(args.mem_frac)
 
     log(f"device {cfg.device}" + (f" ({torch.cuda.get_device_name(0)})" if cfg.device == "cuda" else ""))
     data, vocab = load_smoke_data(cfg) if cfg.smoke else load_real_data(cfg)
+    if args.prepare_only:
+        log("data ready; --prepare-only, exiting")
+        return
     chunks = {k: to_chunks(v, cfg.block_size) for k, v in data.items()}
-    out_dir = os.path.join(args.results_dir, args.tag)
+    out_dir = os.path.join(args.results_dir, args.tag or ("v2" if args.preset == "v2" else "main"))
     os.makedirs(out_dir, exist_ok=True)
     for seed in args.seeds:
         log(f"=== seed {seed} ===")
