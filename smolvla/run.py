@@ -74,7 +74,8 @@ def run(cmd, log_path):
     with open(log_path, "w") as f:
         f.write("$ " + " ".join(cmd) + "\n")
         f.flush()
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, bufsize=1)
         lines = []
         for line in p.stdout:
             f.write(line)

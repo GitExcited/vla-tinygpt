@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 ENV=${VLA_ENV:-$HOME/ruiz/env_vla}
 export HF_HOME=${HF_HOME:-$HOME/ruiz/hf_cache} PIP_CACHE_DIR=${PIP_CACHE_DIR:-$HOME/ruiz/pip_cache}
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES=${GPU:-0}
+export LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH:-$HOME/ruiz/libero_config}   # not the shared ~/.libero
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 if [ ! -d "$ENV" ]; then
@@ -28,6 +29,16 @@ if ! python -c "import lerobot, libero" 2>/dev/null; then
     pip install -q "lerobot[smolvla,libero] @ git+https://github.com/huggingface/lerobot.git" || exit 1; }
   conda install -y -q -c conda-forge ffmpeg >/dev/null 2>&1 || echo "   (ffmpeg via conda failed; continuing)"
 fi
+
+echo "== LIBERO config ($LIBERO_CONFIG_PATH)"
+# On first import LIBERO asks on the terminal where its files are; answer "no" (use the defaults)
+# once, so the config file exists and later background imports do not stop.
+if [ ! -f "$LIBERO_CONFIG_PATH/config.yaml" ]; then
+  mkdir -p "$LIBERO_CONFIG_PATH"
+  printf 'n\nn\nn\n' | python -c "import libero.libero" >/dev/null 2>&1
+fi
+[ -f "$LIBERO_CONFIG_PATH/config.yaml" ] && echo "   ok" || { echo "   could not create the LIBERO config"; exit 1; }
+python -c "import libero.libero" </dev/null || { echo "   LIBERO import still fails"; exit 1; }
 
 echo "== GPU check"
 if ! python -c "import torch; x=torch.randn(512,512,device='cuda'); (x@x).sum().item(); print('   torch', torch.__version__, 'on', torch.cuda.get_device_name(0))"; then

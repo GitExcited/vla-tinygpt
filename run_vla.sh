@@ -30,6 +30,7 @@ fi
 export GPU=${GPU:-0}
 export HF_HOME=${HF_HOME:-$HOME/ruiz/hf_cache} PIP_CACHE_DIR=${PIP_CACHE_DIR:-$HOME/ruiz/pip_cache}
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1
+export LIBERO_CONFIG_PATH=${LIBERO_CONFIG_PATH:-$HOME/ruiz/libero_config}
 ENV=${VLA_ENV:-$HOME/ruiz/env_vla}
 SEEDS=${VLA_SEEDS:-"0 1 2"}
 echo "== $(date) run $RUN_ID on $(hostname), GPU $GPU, seeds [$SEEDS]"
