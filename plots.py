@@ -27,6 +27,7 @@ ARMS = {"A": ("#2a78d6", "A · stories first"),
         "S": ("#4a3aa7", "S · from scratch (stage 3 only)")}
 STAGE1 = {"A": "trains on stories", "B": None, "C": "trains on Wikipedia"}
 
+import logging; logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)   # Segoe UI is missing on Linux: fall back quietly
 plt.rcParams.update({"font.family": ["Segoe UI", "DejaVu Sans"], "font.size": 9.5,
                      "axes.edgecolor": AXIS, "axes.labelcolor": INK2,
                      "xtick.color": MUTED, "ytick.color": MUTED})
