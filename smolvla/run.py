@@ -32,6 +32,10 @@ from dataclasses import asdict, dataclass, field, replace
 from .tasks import TASK_TO_SUITE, norm
 
 DATASET = os.environ.get("VLA_DATASET", "lerobot/libero")
+# VLA_FULL=1: train the whole model (vision encoder + language model + action expert), as the VLA
+# paper does for Pi0. Default (unset): smolvla_base's own setting, only the action expert trains.
+FULL = os.environ.get("VLA_FULL", "") not in ("", "0")
+FULL_ARGS = ["--policy.train_expert_only=false", "--policy.freeze_vision_encoder=false"] if FULL else []
 ARMS = {"A": ["object_pre", "goal", "object_fresh"],
         "C": ["spatial", "goal", "object_fresh"],
         "B": ["goal", "object_fresh"],
@@ -192,7 +196,7 @@ def train(cfg, init_args, extra, episodes, steps, stage_dir, seed, save_freq, lo
            f"--dataset.video_backend={video_backend()}", f"--batch_size={cfg.batch_size}",
            f"--num_workers={cfg.num_workers}", f"--steps={steps}", f"--save_freq={save_freq}",
            f"--log_freq={log_freq}", "--eval_freq=0", "--wandb.enable=false", f"--seed={seed}",
-           f"--output_dir={stage_dir}", *extra]
+           f"--output_dir={stage_dir}", *extra, *FULL_ARGS]
     t0 = time.time()
     rc, out = run(cmd, stage_dir + ".log")
     if rc != 0 or not os.path.exists(ckpt(stage_dir)):
@@ -321,7 +325,10 @@ def main():
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
     cfg = replace(Cfg(), **SMOKE) if args.smoke else Cfg()
-    out = args.out or ("results/vla_smoke" if args.smoke else "results/vla")
+    out = args.out or ("results/vla_smoke" if args.smoke else ("results/vla_full" if FULL else "results/vla"))
+    if os.environ.get("VLA_BATCH"):
+        cfg = replace(cfg, batch_size=int(os.environ["VLA_BATCH"]))
+    log(f"training: {'WHOLE model (VLA_FULL=1)' if FULL else 'action expert only (smolvla_base default)'}, batch {cfg.batch_size}")
     os.makedirs(out, exist_ok=True)
     for tool in ("lerobot-train", "lerobot-eval"):
         if shutil.which(tool) is None:
